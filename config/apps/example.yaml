@@ -1,0 +1,12 @@
+# Copy this file per onboarded app — filename doesn't matter, app_id does.
+app_id: mcp-error-handler
+repo_url: git@github.com:org/mcp-error-handler.git
+default_branch: main
+jira_project_key: MCP
+slack_channel: "#alerts"
+confluence_space: MCP
+ai_provider: claude # claude | codex
+test_cmd: npm test && npm run typecheck # optional — omitting it skips the local gate and goes straight to a PR
+default_assignee: jane@org.com # fallback when git blame can't resolve a Jira user
+local_max_attempts: 3
+ci_max_attempts: 3

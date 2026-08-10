@@ -1,0 +1,13 @@
+services:
+  mcp-error-handler:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./config/apps:/app/config/apps:ro
+      - data:/app/data
+
+volumes:
+  data:
