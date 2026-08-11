@@ -5,7 +5,9 @@ services:
     mem_limit: 512m
     cpus: 1
     ports:
-      - "127.0.0.1:${PORT:-3010}:3000"
+      # Same PORT both sides: it's also injected into the container via env_file below,
+      # so the app listens on whatever PORT is set to — the mapping has to match it, not 3000.
+      - "127.0.0.1:${PORT:-3010}:${PORT:-3010}"
     env_file:
       - .env
     volumes:
