@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { execFile as execFileCb, exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import { getAppConfig } from "./config.js";
+import { authenticatedCloneUrl } from "./github-app.js";
+import { NotImplementedError } from "./errors.js";
 import type {
   AppConfig,
   ErrorReport,
@@ -18,14 +20,6 @@ import type {
 const execFile = promisify(execFileCb);
 const REPO_CACHE_DIR = process.env.REPO_CACHE_DIR ?? join(process.cwd(), "data", "repos");
 const WORKTREE_DIR = process.env.WORKTREE_DIR ?? join(process.cwd(), "data", "worktrees");
-
-/** Marks a pipeline step that needs a real external integration (AI provider, Jira, GitHub, Slack) wired in before it can run. */
-export class NotImplementedError extends Error {
-  constructor(step: string, detail: string) {
-    super(`${step} is not implemented yet: ${detail}`);
-    this.name = "NotImplementedError";
-  }
-}
 
 /** In-memory job state so a later CI webhook can find its way back to the right worktree/branch/attempt count. Swap for real storage before running more than one replica. */
 interface Job {
@@ -45,10 +39,13 @@ async function run(cmd: string, args: string[], cwd: string): Promise<string> {
 
 async function ensureRepoCloned(config: AppConfig): Promise<string> {
   const repoDir = join(REPO_CACHE_DIR, config.appId);
+  const authedUrl = await authenticatedCloneUrl(config.repoUrl);
   if (!existsSync(join(repoDir, ".git"))) {
     await mkdir(dirname(repoDir), { recursive: true });
-    await execFile("git", ["clone", config.repoUrl, repoDir]);
+    await execFile("git", ["clone", authedUrl, repoDir]);
   } else {
+    // Installation tokens expire hourly, so refresh the stored remote URL before every fetch.
+    await run("git", ["remote", "set-url", "origin", authedUrl], repoDir);
     await run("git", ["fetch", "origin", config.defaultBranch], repoDir);
   }
   return repoDir;
@@ -111,8 +108,10 @@ async function createJiraTicket(config: AppConfig, report: ErrorReport, analysis
 
 /** TODO: wire to the GitHub REST API to open the PR once the branch is pushed. */
 async function pushBranchAndOpenPR(config: AppConfig, job: Job, ticket: JiraTicket): Promise<PullRequest> {
+  const authedUrl = await authenticatedCloneUrl(config.repoUrl);
+  await run("git", ["remote", "set-url", "origin", authedUrl], job.worktreePath);
   await run("git", ["push", "-u", "origin", job.branchName], job.worktreePath);
-  throw new NotImplementedError("openPullRequest", `branch ${job.branchName} is pushed — needs GitHub App/PAT auth to open the PR against ${config.repoUrl}`);
+  throw new NotImplementedError("openPullRequest", `branch ${job.branchName} is pushed — needs the GitHub App's installation token to open the PR against ${config.repoUrl}`);
 }
 
 /** TODO: wire to Slack's chat.postMessage (or an incoming webhook) for config.slackChannel. */

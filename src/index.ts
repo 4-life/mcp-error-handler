@@ -3,7 +3,7 @@ import express, { type ErrorRequestHandler } from "express";
 import { createMcpRouter } from "./mcp.js";
 import { createWebhookRouter } from "./webhooks.js";
 import { reloadAppConfigs } from "./config.js";
-import { NotImplementedError } from "./orchestrator.js";
+import { NotImplementedError } from "./errors.js";
 
 reloadAppConfigs();
 

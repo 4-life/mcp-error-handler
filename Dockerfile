@@ -9,7 +9,8 @@ COPY src ./src
 RUN npm run build
 
 FROM node:24-alpine
-RUN apk add --no-cache git openssh-client
+# Just git — repo auth is HTTPS via the GitHub App's installation token, no SSH needed.
+RUN apk add --no-cache git
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000 \

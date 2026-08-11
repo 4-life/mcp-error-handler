@@ -1,8 +1,11 @@
 services:
   mcp-error-handler:
     build: .
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1
     ports:
-      - "${PORT:-3000}:3000"
+      - "127.0.0.1:${PORT:-3010}:3000"
     env_file:
       - .env
     volumes:
