@@ -183,13 +183,19 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
  * (the MCP tool, manual testing).
  */
 export function reportErrorAsync(report: ErrorReport): { branchName: string; accepted: boolean } {
-  getAppConfig(report.appId); // throws synchronously on an unknown app_id, surfacing immediately
+  const config = getAppConfig(report.appId); // throws synchronously on an unknown app_id, surfacing immediately
   const branchName = `fix/${fingerprintReport(report)}`;
   if (inFlightBranches.has(branchName)) {
     return { branchName, accepted: false };
   }
   reportError(report).catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
     console.error(`reportError failed for app "${report.appId}" (branch ${branchName}):`, err);
+    // Best-effort — if the failure is Slack itself (bad token, rate limit), this would just fail
+    // again; log rather than let a second throw escape this .catch() as an unhandled rejection.
+    getMessengerProvider(config.messengerProvider)
+      .alertError(config, `Branch \`${branchName}\`: ${message}`)
+      .catch((alertErr) => console.error("Also failed to send the Slack alert for that failure:", alertErr));
   });
   return { branchName, accepted: true };
 }

@@ -11,6 +11,7 @@ test("each registry resolves its default provider with the right shape", () => {
   assert.equal(typeof getTrackerProvider("jira").createTicket, "function");
   assert.equal(typeof getDocsProvider("confluence").fetchDocs, "function");
   assert.equal(typeof getMessengerProvider("slack").notify, "function");
+  assert.equal(typeof getMessengerProvider("slack").alertError, "function");
   assert.equal(typeof getLLMProvider("claude").draftFix, "function");
   assert.equal(typeof getLLMProvider("codex").draftFix, "function");
 });
