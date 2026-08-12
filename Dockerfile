@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:24-alpine AS builder
+FROM node:24-slim AS builder
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci
@@ -8,9 +8,13 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-FROM node:24-alpine
-# Just git — repo auth is HTTPS via the GitHub App's installation token, no SSH needed.
-RUN apk add --no-cache git
+FROM node:24-slim
+# git for repo ops; ca-certificates for HTTPS calls to GitHub/Jira/Slack/Anthropic.
+# Debian slim (glibc), not alpine — the Claude Agent SDK ships a compiled native binary that
+# fails to launch on musl/Alpine even when the "-musl" package variant resolves correctly;
+# glibc is what these prebuilt binaries are actually built and tested against.
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000 \
