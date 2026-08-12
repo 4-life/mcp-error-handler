@@ -7,6 +7,11 @@ import type { ExistingPullRequest } from "../repo/types.js";
 import type { LLMProvider } from "./types.js";
 
 const MAX_TURNS = 30;
+/** Per-session cap — the SDK itself stops the query and returns `error_max_budget_usd` if a single draftFix run exceeds this. */
+const MAX_USD_PER_DRAFT = Number(process.env.MAX_USD_PER_DRAFT ?? 2);
+/** Cumulative cap across every session this process has run — the safety net a per-session cap alone can't provide against an error storm spawning many distinct sessions. In-memory, resets on restart, same caveat as everything else that's process-local in this codebase. */
+const MAX_TOTAL_USD = Number(process.env.MAX_TOTAL_USD ?? 50);
+let cumulativeSpendUsd = 0;
 
 const resultSchema = z.union([
   z.object({ action: z.literal("skip"), reason: z.string() }),
@@ -76,6 +81,13 @@ async function draftFix(
   worktreePath: string,
   existingPR: ExistingPullRequest | undefined,
 ): Promise<DraftResult> {
+  if (cumulativeSpendUsd >= MAX_TOTAL_USD) {
+    throw new Error(
+      `draftFix: cumulative AI spend ($${cumulativeSpendUsd.toFixed(2)}) has reached the MAX_TOTAL_USD cap ` +
+        `($${MAX_TOTAL_USD}) — refusing to start another session. Restart the server or raise MAX_TOTAL_USD to resume.`,
+    );
+  }
+
   const docsContext = await getDocsContext(config);
   const prompt = buildPrompt(report, config, existingPR, docsContext);
 
@@ -87,11 +99,12 @@ async function draftFix(
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       maxTurns: MAX_TURNS,
+      maxBudgetUsd: MAX_USD_PER_DRAFT,
       outputFormat: { type: "json_schema", schema: outputJsonSchema },
     },
   });
 
-  let final: { subtype: string; structured_output?: unknown; errors?: string[] } | undefined;
+  let final: { subtype: string; structured_output?: unknown; errors?: string[]; total_cost_usd: number } | undefined;
   for await (const message of stream) {
     if (message.type === "result") final = message;
   }
@@ -99,6 +112,13 @@ async function draftFix(
   if (!final) {
     throw new Error("draftFix: agent session ended without a result message");
   }
+
+  // Count cost regardless of outcome — a failed/budget-capped session still burns real tokens.
+  cumulativeSpendUsd += final.total_cost_usd;
+  console.log(
+    `draftFix: session cost $${final.total_cost_usd.toFixed(4)}, cumulative $${cumulativeSpendUsd.toFixed(2)} / $${MAX_TOTAL_USD} cap`,
+  );
+
   if (final.subtype !== "success") {
     throw new Error(`draftFix: agent session failed (${final.subtype}): ${final.errors?.join("; ") ?? "no details"}`);
   }

@@ -28,6 +28,34 @@ const jobs = new Map<string, Job>();
  */
 const inFlightBranches = new Set<string>();
 
+/** Caps how many draftFix calls (the slow, costly, rate-limited part) run at once, queuing the rest — unrelated to inFlightBranches, which caps duplicates of the *same* error rather than total load. */
+class Semaphore {
+  private available: number;
+  private readonly queue: Array<() => void> = [];
+
+  constructor(limit: number) {
+    this.available = limit;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.available > 0) {
+      this.available -= 1;
+      return;
+    }
+    await new Promise<void>((resolve) => this.queue.push(resolve));
+  }
+
+  release(): void {
+    const next = this.queue.shift();
+    if (next) {
+      next();
+    } else {
+      this.available += 1;
+    }
+  }
+}
+const draftSemaphore = new Semaphore(Number(process.env.MAX_CONCURRENT_DRAFTS ?? 3));
+
 /**
  * A stable id for "this error" — used as the branch name, which is what makes the repo host's
  * own PR list double as the dedup store (see RepoProvider.findExistingPullRequest). Prefers a
@@ -100,7 +128,13 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
     let lastTestOutput = "";
 
     for (let attempt = 1; attempt <= config.localMaxAttempts; attempt++) {
-      const result = await llm.draftFix(report, config, worktreePath, existingPR);
+      await draftSemaphore.acquire();
+      let result;
+      try {
+        result = await llm.draftFix(report, config, worktreePath, existingPR);
+      } finally {
+        draftSemaphore.release();
+      }
       if (result.action === "skip") {
         skipReason = result.reason;
         break;
@@ -138,6 +172,26 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
   } finally {
     inFlightBranches.delete(branchName);
   }
+}
+
+/**
+ * Fire-and-forget entry point for webhook routes, where the sender (Sentry's webhook delivery,
+ * for instance) likely has its own timeout far shorter than a multi-minute AI-driven run.
+ * Validates synchronously (bad app_id, already-in-flight) so those still surface immediately to
+ * the caller — only the slow part (the actual pipeline) runs in the background. reportError()
+ * itself is unchanged and still fully awaitable for callers that want the real result inline
+ * (the MCP tool, manual testing).
+ */
+export function reportErrorAsync(report: ErrorReport): { branchName: string; accepted: boolean } {
+  getAppConfig(report.appId); // throws synchronously on an unknown app_id, surfacing immediately
+  const branchName = `fix/${fingerprintReport(report)}`;
+  if (inFlightBranches.has(branchName)) {
+    return { branchName, accepted: false };
+  }
+  reportError(report).catch((err) => {
+    console.error(`reportError failed for app "${report.appId}" (branch ${branchName}):`, err);
+  });
+  return { branchName, accepted: true };
 }
 
 /**
