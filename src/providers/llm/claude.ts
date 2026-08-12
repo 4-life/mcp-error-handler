@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { z } from "zod";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { getDocsProvider } from "../docs/index.js";
@@ -86,6 +87,12 @@ async function draftFix(
       `draftFix: cumulative AI spend ($${cumulativeSpendUsd.toFixed(2)}) has reached the MAX_TOTAL_USD cap ` +
         `($${MAX_TOTAL_USD}) — refusing to start another session. Restart the server or raise MAX_TOTAL_USD to resume.`,
     );
+  }
+  if (!existsSync(worktreePath)) {
+    // The SDK spawns the Claude binary with cwd: worktreePath — if that directory doesn't exist,
+    // the spawn fails with a confusing "binary failed to launch" ENOENT that looks like a broken
+    // install, not a missing cwd. Fail loudly and specifically instead.
+    throw new Error(`draftFix: worktree directory does not exist: ${worktreePath}`);
   }
 
   const docsContext = await getDocsContext(config);

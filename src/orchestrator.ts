@@ -133,24 +133,31 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
     let skipReason: string | undefined;
     let lastTestOutput = "";
 
-    for (let attempt = 1; attempt <= config.localMaxAttempts; attempt++) {
-      await draftSemaphore.acquire();
-      let result;
-      try {
-        result = await llm.draftFix(report, config, worktreePath, existingPR);
-      } finally {
-        draftSemaphore.release();
+    try {
+      for (let attempt = 1; attempt <= config.localMaxAttempts; attempt++) {
+        await draftSemaphore.acquire();
+        let result;
+        try {
+          result = await llm.draftFix(report, config, worktreePath, existingPR);
+        } finally {
+          draftSemaphore.release();
+        }
+        if (result.action === "skip") {
+          skipReason = result.reason;
+          break;
+        }
+        const testResult = await runLocalTests(config, worktreePath);
+        if (testResult.passed) {
+          draft = result.draft;
+          break;
+        }
+        lastTestOutput = testResult.output;
       }
-      if (result.action === "skip") {
-        skipReason = result.reason;
-        break;
-      }
-      const testResult = await runLocalTests(config, worktreePath);
-      if (testResult.passed) {
-        draft = result.draft;
-        break;
-      }
-      lastTestOutput = testResult.output;
+    } catch (err) {
+      // Clean up so a retry of the same error isn't blocked by `git worktree add -b` refusing
+      // to recreate a branch this failed attempt left behind.
+      await repo.removeWorktree(repoDir, worktreePath).catch(() => undefined);
+      throw err;
     }
 
     if (skipReason) {
