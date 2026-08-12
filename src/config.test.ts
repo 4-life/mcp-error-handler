@@ -28,6 +28,10 @@ test("getAppConfig maps required fields and fills in defaults", () => {
   assert.equal(config.jiraProjectKey, "TST");
   assert.equal(config.slackChannel, "#test-alerts");
   assert.equal(config.defaultBranch, "main");
+  assert.equal(config.repoProvider, "github");
+  assert.equal(config.trackerProvider, "jira");
+  assert.equal(config.docsProvider, "confluence");
+  assert.equal(config.messengerProvider, "slack");
   assert.equal(config.aiProvider, "claude");
   assert.equal(config.localMaxAttempts, 3);
   assert.equal(config.ciMaxAttempts, 3);

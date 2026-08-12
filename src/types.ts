@@ -2,6 +2,10 @@ export interface AppConfig {
   appId: string;
   repoUrl: string;
   defaultBranch: string;
+  repoProvider: "github";
+  trackerProvider: "jira";
+  docsProvider: "confluence";
+  messengerProvider: "slack";
   jiraProjectKey: string;
   slackChannel: string;
   confluenceSpace?: string;
@@ -21,18 +25,24 @@ export interface ErrorReport {
 }
 
 export interface FixDraft {
-  branchName: string;
-  worktreePath: string;
   summary: string;
   filesChanged: string[];
 }
+
+/**
+ * draftFix's result: the AI decides, from the full report + existing-PR context + repo access,
+ * whether this is even worth acting on (production? already handled?) before ever producing a
+ * diff. "skip" means nothing downstream happens — no ticket, no branch pushed, nothing.
+ */
+export type DraftResult = { action: "skip"; reason: string } | { action: "fix"; draft: FixDraft };
 
 export interface TestRunResult {
   passed: boolean;
   output: string;
 }
 
-export interface JiraTicket {
+/** A tracker issue — generic name since Jira, GitHub Issues, and Redmine all produce this same shape. */
+export interface Ticket {
   key: string;
   url: string;
   assignee?: string;
@@ -46,7 +56,9 @@ export interface PullRequest {
 export interface ReportErrorResult {
   jobId: string;
   appId: string;
-  ticket?: JiraTicket;
+  ticket?: Ticket;
   pullRequest?: PullRequest;
-  status: "ticket_only" | "pr_opened" | "pr_pending_ci";
+  status: "skipped" | "ticket_only" | "pr_opened" | "pr_pending_ci";
+  /** Why the AI skipped — only present when status is "skipped". */
+  reason?: string;
 }

@@ -2,6 +2,10 @@
 app_id: mcp-error-handler
 repo_url: git@github.com:4-life/mcp-error-handler.git
 default_branch: main
+# repo_provider: github            # optional — github is the only one implemented today
+# tracker_provider: jira           # optional — jira is the only one implemented today
+# docs_provider: confluence        # optional — confluence is the only one implemented today
+# messenger_provider: slack        # optional — slack is the only one implemented today
 jira_project_key: MCP
 slack_channel: "#alerts"
 confluence_space: MCP

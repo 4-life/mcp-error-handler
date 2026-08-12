@@ -1,25 +1,13 @@
-import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { execFile as execFileCb, exec as execCb } from "node:child_process";
+import { randomUUID, createHash } from "node:crypto";
+import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import { getAppConfig } from "./config.js";
-import { authenticatedCloneUrl } from "./github-app.js";
+import { getRepoProvider } from "./providers/repo/index.js";
+import { getTrackerProvider } from "./providers/tracker/index.js";
+import { getMessengerProvider } from "./providers/messenger/index.js";
+import { getLLMProvider } from "./providers/llm/index.js";
 import { NotImplementedError } from "./errors.js";
-import type {
-  AppConfig,
-  ErrorReport,
-  FixDraft,
-  JiraTicket,
-  PullRequest,
-  ReportErrorResult,
-  TestRunResult,
-} from "./types.js";
-
-const execFile = promisify(execFileCb);
-const REPO_CACHE_DIR = process.env.REPO_CACHE_DIR ?? join(process.cwd(), "data", "repos");
-const WORKTREE_DIR = process.env.WORKTREE_DIR ?? join(process.cwd(), "data", "worktrees");
+import type { AppConfig, ErrorReport, FixDraft, ReportErrorResult, Ticket, TestRunResult } from "./types.js";
 
 /** In-memory job state so a later CI webhook can find its way back to the right worktree/branch/attempt count. Swap for real storage before running more than one replica. */
 interface Job {
@@ -28,43 +16,36 @@ interface Job {
   worktreePath: string;
   branchName: string;
   ciAttempts: number;
-  ticket?: JiraTicket;
+  ticket?: Ticket;
 }
 const jobs = new Map<string, Job>();
 
-async function run(cmd: string, args: string[], cwd: string): Promise<string> {
-  const { stdout } = await execFile(cmd, args, { cwd });
-  return stdout.trim();
+/**
+ * Branch names currently being worked on. Guards the window the PR-based dedup check can't see:
+ * a second identical error arriving while the first is still mid-pipeline (before anything's been
+ * pushed) would otherwise race to create the same git worktree. In-memory only — see the Job map
+ * comment above for the same caveat.
+ */
+const inFlightBranches = new Set<string>();
+
+/**
+ * A stable id for "this error" — used as the branch name, which is what makes the repo host's
+ * own PR list double as the dedup store (see RepoProvider.findExistingPullRequest). Prefers a
+ * source-provided stable id (e.g. Sentry's grouped issue id) so repeated firings of the same
+ * issue map to the same branch; falls back to hashing the whole payload for sources with no
+ * recognizable id, which won't dedupe as well but is at least deterministic for identical
+ * payloads.
+ */
+function fingerprintReport(report: ErrorReport): string {
+  const data = report.data as Record<string, unknown> | undefined;
+  const nested = data?.data as Record<string, unknown> | undefined;
+  const issue = nested?.issue as Record<string, unknown> | undefined;
+  const stableId = issue?.id ?? data?.id;
+  const basis = stableId !== undefined ? String(stableId) : JSON.stringify(report.data);
+  return createHash("sha256").update(basis).digest("hex").slice(0, 12);
 }
 
-async function ensureRepoCloned(config: AppConfig): Promise<string> {
-  const repoDir = join(REPO_CACHE_DIR, config.appId);
-  const authedUrl = await authenticatedCloneUrl(config.repoUrl);
-  if (!existsSync(join(repoDir, ".git"))) {
-    await mkdir(dirname(repoDir), { recursive: true });
-    await execFile("git", ["clone", authedUrl, repoDir]);
-  } else {
-    // Installation tokens expire hourly, so refresh the stored remote URL before every fetch.
-    await run("git", ["remote", "set-url", "origin", authedUrl], repoDir);
-    await run("git", ["fetch", "origin", config.defaultBranch], repoDir);
-  }
-  return repoDir;
-}
-
-async function createFixWorktree(config: AppConfig, repoDir: string, jobId: string): Promise<{ worktreePath: string; branchName: string }> {
-  const branchName = `fix/${jobId.slice(0, 8)}`;
-  const worktreePath = join(WORKTREE_DIR, config.appId, branchName);
-  await mkdir(dirname(worktreePath), { recursive: true });
-  await run("git", ["worktree", "add", "-b", branchName, worktreePath, `origin/${config.defaultBranch}`], repoDir);
-  return { worktreePath, branchName };
-}
-
-async function removeFixWorktree(repoDir: string, worktreePath: string): Promise<void> {
-  await run("git", ["worktree", "remove", "--force", worktreePath], repoDir).catch(() => undefined);
-  await rm(worktreePath, { recursive: true, force: true });
-}
-
-/** Runs the app's configured test_cmd inside the worktree and captures pass/fail plus combined output, regardless of exit code. */
+/** Runs the app's configured test_cmd inside the worktree and captures pass/fail plus combined output, regardless of exit code. Pure local process execution — nothing to do with any repo host, so it stays here rather than in a provider. */
 async function runLocalTests(config: AppConfig, worktreePath: string): Promise<TestRunResult> {
   if (!config.testCmd) {
     return { passed: true, output: "(no test_cmd configured — local gate skipped)" };
@@ -79,97 +60,91 @@ async function runLocalTests(config: AppConfig, worktreePath: string): Promise<T
   }
 }
 
-/** Last committer's email per changed file — a stand-in for blaming the exact changed line ranges once draftFix reports them. */
-async function findLikelyOwners(repoDir: string, files: string[]): Promise<string[]> {
-  const emails = await Promise.all(
-    files.map((file) =>
-      run("git", ["log", "-1", "--format=%ae", "--", file], repoDir).catch(() => ""),
-    ),
-  );
-  return [...new Set(emails.filter(Boolean))];
-}
-
 /**
- * TODO: wire to the configured ai_provider (claude | codex). Should read the error report,
- * the worktree's code, and — when config.confluenceSpace is set — the app's Confluence docs,
- * then write a fix to the worktree and return which files it touched.
- */
-async function draftFix(report: ErrorReport, config: AppConfig, worktreePath: string): Promise<FixDraft> {
-  throw new NotImplementedError(
-    "draftFix",
-    `no integration for ai_provider "${config.aiProvider}" — worktree is ready at ${worktreePath}`,
-  );
-}
-
-/** TODO: wire to the Jira REST API (create issue, then assignee lookup by email). */
-async function createJiraTicket(config: AppConfig, report: ErrorReport, analysis: string, assigneeEmail?: string): Promise<JiraTicket> {
-  throw new NotImplementedError("createJiraTicket", `project ${config.jiraProjectKey}, assignee candidate ${assigneeEmail ?? config.defaultAssignee ?? "none"}`);
-}
-
-/** TODO: wire to the GitHub REST API to open the PR once the branch is pushed. */
-async function pushBranchAndOpenPR(config: AppConfig, job: Job, ticket: JiraTicket): Promise<PullRequest> {
-  const authedUrl = await authenticatedCloneUrl(config.repoUrl);
-  await run("git", ["remote", "set-url", "origin", authedUrl], job.worktreePath);
-  await run("git", ["push", "-u", "origin", job.branchName], job.worktreePath);
-  throw new NotImplementedError("openPullRequest", `branch ${job.branchName} is pushed — needs the GitHub App's installation token to open the PR against ${config.repoUrl}`);
-}
-
-/** TODO: wire to Slack's chat.postMessage (or an incoming webhook) for config.slackChannel. */
-async function notifySlack(config: AppConfig, ticket: JiraTicket, pr?: PullRequest): Promise<void> {
-  throw new NotImplementedError("notifySlack", `channel ${config.slackChannel}`);
-}
-
-/**
- * The pipeline described in README.md: load config, update the repo, draft a fix, run tests
- * locally with a revise loop, create the Jira ticket, and — once local tests pass — push and
- * open a PR. The GitHub Actions CI follow-up loop lives in handleCIResult below, since CI
+ * Load config, resolve this app's providers, update the repo, then hand everything to the AI in
+ * one call: the raw report, whether a PR already exists for this error's branch, and full repo
+ * access. The AI is the single decision point — production vs. not, already handled vs. not, and
+ * (if it decides to proceed) the fix itself. Nothing is created — no ticket, no branch pushed —
+ * until it says so. If the AI isn't configured at all, this fails outright (NotImplementedError
+ * propagates) rather than falling back to a ticket — a ticket without the AI's judgment isn't the
+ * intended behavior. The GitHub Actions CI follow-up loop lives in handleCIResult below, since CI
  * completion arrives later as its own webhook event, not inline in this call.
  */
 export async function reportError(report: ErrorReport): Promise<ReportErrorResult> {
   const config = getAppConfig(report.appId);
+  const repo = getRepoProvider(config.repoProvider);
+  const tracker = getTrackerProvider(config.trackerProvider);
+  const messenger = getMessengerProvider(config.messengerProvider);
+  const llm = getLLMProvider(config.aiProvider);
+
   const jobId = randomUUID();
-  const repoDir = await ensureRepoCloned(config);
-  const { worktreePath, branchName } = await createFixWorktree(config, repoDir, jobId);
-  const job: Job = { jobId, appId: config.appId, worktreePath, branchName, ciAttempts: 0 };
-  jobs.set(jobId, job);
+  const branchName = `fix/${fingerprintReport(report)}`;
 
-  let draft: FixDraft | undefined;
-  let lastTestOutput = "";
+  if (inFlightBranches.has(branchName)) {
+    return { jobId, appId: config.appId, status: "skipped", reason: "an identical error is already being processed" };
+  }
+  inFlightBranches.add(branchName);
+
   try {
+    // Fetched deterministically (it's just a repo-host API call) — but what to do with it is the
+    // AI's call, made together with the production/non-production judgment inside draftFix.
+    const existingPR = await repo.findExistingPullRequest(config.repoUrl, branchName);
+
+    const repoDir = await repo.ensureCloned(config);
+    const worktreePath = await repo.createWorktree(config, repoDir, branchName);
+    const job: Job = { jobId, appId: config.appId, worktreePath, branchName, ciAttempts: 0 };
+    jobs.set(jobId, job);
+
+    let draft: FixDraft | undefined;
+    let skipReason: string | undefined;
+    let lastTestOutput = "";
+
     for (let attempt = 1; attempt <= config.localMaxAttempts; attempt++) {
-      draft = await draftFix(report, config, worktreePath);
-      const result = await runLocalTests(config, worktreePath);
-      if (result.passed) break;
-      lastTestOutput = result.output;
-      draft = undefined;
+      const result = await llm.draftFix(report, config, worktreePath, existingPR);
+      if (result.action === "skip") {
+        skipReason = result.reason;
+        break;
+      }
+      const testResult = await runLocalTests(config, worktreePath);
+      if (testResult.passed) {
+        draft = result.draft;
+        break;
+      }
+      lastTestOutput = testResult.output;
     }
-  } catch (err) {
-    if (!(err instanceof NotImplementedError)) throw err;
-    // No AI provider wired yet — fall through to a ticket-only report using the raw error text.
+
+    if (skipReason) {
+      await repo.removeWorktree(repoDir, worktreePath);
+      return { jobId, appId: config.appId, status: "skipped", reason: skipReason };
+    }
+
+    const owners = draft ? await repo.blameAuthors(repoDir, draft.filesChanged) : [];
+    const analysis = draft
+      ? draft.summary
+      : `AI drafted a fix but it never passed local tests after ${config.localMaxAttempts} attempts.\nLast failure:\n${lastTestOutput}`;
+    const ticket = await tracker.createTicket(config, report, analysis, owners[0]);
+    job.ticket = ticket;
+
+    if (!draft) {
+      await repo.removeWorktree(repoDir, worktreePath);
+      await messenger.notify(config, ticket);
+      return { jobId, appId: config.appId, ticket, status: "ticket_only" };
+    }
+
+    await repo.pushBranch(config, worktreePath, branchName);
+    const pr = await repo.openPullRequest(config, branchName, draft.summary.slice(0, 72), ticket.url);
+    await messenger.notify(config, ticket, pr);
+    return { jobId, appId: config.appId, ticket, pullRequest: pr, status: "pr_pending_ci" };
+  } finally {
+    inFlightBranches.delete(branchName);
   }
-
-  const owners = draft ? await findLikelyOwners(repoDir, draft.filesChanged) : [];
-  const analysis = draft
-    ? draft.summary
-    : `Automated analysis unavailable (${lastTestOutput || "no AI provider configured"}). Raw report:\n${JSON.stringify(report.data, null, 2)}`;
-  const ticket = await createJiraTicket(config, report, analysis, owners[0]);
-  job.ticket = ticket;
-
-  if (!draft) {
-    await removeFixWorktree(repoDir, worktreePath);
-    await notifySlack(config, ticket);
-    return { jobId, appId: config.appId, ticket, status: "ticket_only" };
-  }
-
-  const pr = await pushBranchAndOpenPR(config, job, ticket);
-  await notifySlack(config, ticket, pr);
-  return { jobId, appId: config.appId, ticket, pullRequest: pr, status: "pr_pending_ci" };
 }
 
 /**
  * TODO: call this from a GitHub Actions webhook route (workflow_run / check_run completed).
- * On failure, fetch the job log via the Checks API, feed it back through draftFix for a
- * revision, and push again — up to config.ciMaxAttempts — before leaving the PR for a developer.
+ * On failure, fetch the job log via the repo provider's Checks API, feed it back through
+ * draftFix for a revision, and push again — up to config.ciMaxAttempts — before leaving the PR
+ * for a developer.
  */
 export async function handleCIResult(jobId: string, passed: boolean): Promise<void> {
   const job = jobs.get(jobId);

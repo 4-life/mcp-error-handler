@@ -4,6 +4,7 @@ import { createMcpRouter } from "./mcp.js";
 import { createWebhookRouter } from "./webhooks.js";
 import { reloadAppConfigs } from "./config.js";
 import { NotImplementedError } from "./errors.js";
+import { requireSharedSecret } from "./auth.js";
 
 reloadAppConfigs();
 
@@ -12,8 +13,8 @@ app.use(express.json({ limit: "2mb" }));
 
 app.get("/healthz", (_req, res) => res.status(200).json({ status: "ok" }));
 
-app.use("/mcp", createMcpRouter());
-app.use("/webhooks", createWebhookRouter());
+app.use("/mcp", requireSharedSecret, createMcpRouter());
+app.use("/webhooks", requireSharedSecret, createWebhookRouter());
 
 const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   if (err instanceof NotImplementedError) {

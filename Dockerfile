@@ -27,6 +27,9 @@ COPY config ./config
 RUN mkdir -p /app/data && chown -R node:node /app
 VOLUME ["/app/data"]
 USER node
+# The AI agent (and the fallback auto-commit if it forgets) needs a git identity to commit as.
+RUN git config --global user.email "mcp-error-handler@local" && \
+    git config --global user.name "mcp-error-handler"
 
 EXPOSE 3000
 CMD ["node", "dist/index.js"]

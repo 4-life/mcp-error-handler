@@ -9,6 +9,10 @@ interface RawAppConfig {
   app_id: string;
   repo_url: string;
   default_branch?: string;
+  repo_provider?: string;
+  tracker_provider?: string;
+  docs_provider?: string;
+  messenger_provider?: string;
   jira_project_key: string;
   slack_channel: string;
   confluence_space?: string;
@@ -24,6 +28,10 @@ function toAppConfig(raw: RawAppConfig): AppConfig {
     appId: raw.app_id,
     repoUrl: raw.repo_url,
     defaultBranch: raw.default_branch ?? "main",
+    repoProvider: (raw.repo_provider as AppConfig["repoProvider"]) ?? "github",
+    trackerProvider: (raw.tracker_provider as AppConfig["trackerProvider"]) ?? "jira",
+    docsProvider: (raw.docs_provider as AppConfig["docsProvider"]) ?? "confluence",
+    messengerProvider: (raw.messenger_provider as AppConfig["messengerProvider"]) ?? "slack",
     jiraProjectKey: raw.jira_project_key,
     slackChannel: raw.slack_channel,
     confluenceSpace: raw.confluence_space,
