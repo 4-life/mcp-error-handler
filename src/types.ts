@@ -10,6 +10,8 @@ export interface AppConfig {
   slackChannel: string;
   confluenceSpace?: string;
   aiProvider: "claude" | "codex";
+  /** Optional — omitting it auto-detects from the lockfile present (yarn.lock/package-lock.json/pnpm-lock.yaml), or skips entirely for non-npm projects. */
+  installCmd?: string;
   testCmd?: string;
   defaultAssignee?: string;
   localMaxAttempts: number;
@@ -29,12 +31,24 @@ export interface FixDraft {
   filesChanged: string[];
 }
 
+/** What the previous local-test-gate retry attempted and what happened — fed into the next draftFix call so it isn't flying blind on retry, and can recognize a broken test environment (same failure regardless of the fix) instead of endlessly re-guessing. */
+export interface PriorAttempt {
+  summary: string;
+  testOutput: string;
+}
+
 /**
  * draftFix's result: the AI decides, from the full report + existing-PR context + repo access,
  * whether this is even worth acting on (production? already handled?) before ever producing a
- * diff. "skip" means nothing downstream happens — no ticket, no branch pushed, nothing.
+ * diff. "skip" means nothing downstream happens — no ticket, no branch pushed, nothing. "incomplete"
+ * means it genuinely tried (and spent real cost) but hit a budget limit (turns, $) before finishing
+ * — treated like a failed local-test attempt: a ticket for a human, not a thrown error, since
+ * running out of budget on a hard problem isn't a bug in the pipeline itself.
  */
-export type DraftResult = { action: "skip"; reason: string } | { action: "fix"; draft: FixDraft };
+export type DraftResult =
+  | { action: "skip"; reason: string }
+  | { action: "fix"; draft: FixDraft }
+  | { action: "incomplete"; reason: string };
 
 export interface TestRunResult {
   passed: boolean;

@@ -1,4 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import { getAppConfig } from "./config.js";
@@ -7,7 +9,7 @@ import { getTrackerProvider } from "./providers/tracker/index.js";
 import { getMessengerProvider } from "./providers/messenger/index.js";
 import { getLLMProvider } from "./providers/llm/index.js";
 import { NotImplementedError } from "./errors.js";
-import type { AppConfig, ErrorReport, FixDraft, ReportErrorResult, Ticket, TestRunResult } from "./types.js";
+import type { AppConfig, ErrorReport, FixDraft, PriorAttempt, ReportErrorResult, Ticket, TestRunResult } from "./types.js";
 
 /** In-memory job state so a later CI webhook can find its way back to the right worktree/branch/attempt count. Swap for real storage before running more than one replica. */
 interface Job {
@@ -75,6 +77,29 @@ function fingerprintReport(report: ErrorReport): string {
   return createHash("sha256").update(basis).digest("hex").slice(0, 12);
 }
 
+function detectInstallCmd(worktreePath: string): string | undefined {
+  if (existsSync(join(worktreePath, "yarn.lock"))) return "yarn install --frozen-lockfile";
+  if (existsSync(join(worktreePath, "package-lock.json"))) return "npm ci";
+  if (existsSync(join(worktreePath, "pnpm-lock.yaml"))) return "pnpm install --frozen-lockfile";
+  if (existsSync(join(worktreePath, "package.json"))) return "npm install";
+  return undefined; // not an npm project — nothing to install
+}
+
+/**
+ * `git worktree add` only checks out tracked files — node_modules is gitignored, so a fresh
+ * worktree has no dependencies installed at all. Without this, the AI (and runLocalTests right
+ * after it) would hit a completely broken environment: no test runner, no linter, nothing
+ * actually runnable, for every single attempt. Uses config.installCmd if set, otherwise
+ * auto-detects from whichever lockfile is present. Failure here is fatal — there's no point
+ * spending AI budget in an environment that can't run anything.
+ */
+async function installDependencies(config: AppConfig, worktreePath: string): Promise<void> {
+  const cmd = config.installCmd ?? detectInstallCmd(worktreePath);
+  if (!cmd) return;
+  const exec = promisify(execCb);
+  await exec(cmd, { cwd: worktreePath });
+}
+
 /** Runs the app's configured test_cmd inside the worktree and captures pass/fail plus combined output, regardless of exit code. Pure local process execution — nothing to do with any repo host, so it stays here rather than in a provider. */
 async function runLocalTests(config: AppConfig, worktreePath: string): Promise<TestRunResult> {
   if (!config.testCmd) {
@@ -113,32 +138,42 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
   const jobId = randomUUID();
   const fingerprint = fingerprintReport(report);
   const localBranchName = `wip/${fingerprint}`;
+  const log = (msg: string) => console.log(`reportError[${fingerprint}] ${config.appId}: ${msg}`);
 
   if (inFlightFingerprints.has(fingerprint)) {
     return { jobId, appId: config.appId, status: "skipped", reason: "an identical error is already being processed" };
   }
   inFlightFingerprints.add(fingerprint);
+  log("accepted, starting pipeline");
 
   try {
     // Fetched deterministically (it's just a repo-host API call) — but what to do with it is the
     // AI's call, made together with the production/non-production judgment inside draftFix.
+    log("checking for an existing PR");
     const existingPR = await repo.findExistingPullRequestByFingerprint(config.repoUrl, fingerprint);
 
+    log("cloning/pulling repo");
     const repoDir = await repo.ensureCloned(config);
+    log(`creating worktree at branch ${localBranchName}`);
     const worktreePath = await repo.createWorktree(config, repoDir, localBranchName);
+    log(`worktree ready: ${worktreePath}`);
     const job: Job = { jobId, appId: config.appId, worktreePath, localBranchName, ciAttempts: 0 };
     jobs.set(jobId, job);
 
     let draft: FixDraft | undefined;
     let skipReason: string | undefined;
     let lastTestOutput = "";
+    let priorAttempt: PriorAttempt | undefined;
 
     try {
+      log("installing dependencies");
+      await installDependencies(config, worktreePath);
       for (let attempt = 1; attempt <= config.localMaxAttempts; attempt++) {
+        log(`draftFix attempt ${attempt}/${config.localMaxAttempts}`);
         await draftSemaphore.acquire();
         let result;
         try {
-          result = await llm.draftFix(report, config, worktreePath, existingPR);
+          result = await llm.draftFix(report, config, worktreePath, existingPR, priorAttempt);
         } finally {
           draftSemaphore.release();
         }
@@ -146,12 +181,23 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
           skipReason = result.reason;
           break;
         }
+        if (result.action === "incomplete") {
+          // Don't retry — a fresh attempt gets the same turn/budget cap and no new information,
+          // so it would most likely just hit the same wall again at further cost.
+          lastTestOutput = result.reason;
+          break;
+        }
+        log("running local tests");
         const testResult = await runLocalTests(config, worktreePath);
+        log(`local tests ${testResult.passed ? "passed" : "failed"}`);
         if (testResult.passed) {
           draft = result.draft;
           break;
         }
         lastTestOutput = testResult.output;
+        // Fed into the next attempt's prompt so it isn't flying blind on retry — can tell a real
+        // assertion failure from its own fix apart from the test command being broken outright.
+        priorAttempt = { summary: result.draft.summary, testOutput: testResult.output };
       }
     } catch (err) {
       // Clean up so a retry of the same error isn't blocked by `git worktree add -b` refusing
@@ -161,7 +207,7 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
     }
 
     if (skipReason) {
-      console.log(`reportError: skipped app "${config.appId}" (fingerprint ${fingerprint}) — ${skipReason}`);
+      log(`skipped — ${skipReason}`);
       await repo.removeWorktree(repoDir, worktreePath);
       return { jobId, appId: config.appId, status: "skipped", reason: skipReason };
     }
@@ -169,9 +215,11 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
     const owners = draft ? await repo.blameAuthors(repoDir, draft.filesChanged) : [];
     const analysis = draft
       ? draft.summary
-      : `AI drafted a fix but it never passed local tests after ${config.localMaxAttempts} attempts.\nLast failure:\n${lastTestOutput}`;
+      : `AI attempted a fix but didn't produce a working one after ${config.localMaxAttempts} attempt(s).\nDetails:\n${lastTestOutput}`;
+    log("creating Jira ticket");
     const ticket = await tracker.createTicket(config, report, analysis, owners[0]);
     job.ticket = ticket;
+    log(`ticket created: ${ticket.key}`);
 
     if (!draft) {
       await repo.removeWorktree(repoDir, worktreePath);
@@ -181,7 +229,9 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
 
     const remoteBranchName = `fix/${ticket.key}`;
     job.remoteBranchName = remoteBranchName;
+    log(`pushing branch as ${remoteBranchName}`);
     await repo.pushBranch(config, worktreePath, localBranchName, remoteBranchName);
+    log("opening PR");
     const pr = await repo.openPullRequest(config, remoteBranchName, draft.summary.slice(0, 72), ticket.url, fingerprint);
     await messenger.notify(config, ticket, pr);
     return { jobId, appId: config.appId, ticket, pullRequest: pr, status: "pr_pending_ci" };

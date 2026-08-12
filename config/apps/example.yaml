@@ -10,6 +10,7 @@ jira_project_key: MCP
 slack_channel: "#alerts"
 confluence_space: MCP
 ai_provider: claude # claude | codex
+# install_cmd: npm ci               # optional — auto-detected from the lockfile present if omitted
 test_cmd: npm test && npm run typecheck # optional — omitting it skips the local gate and goes straight to a PR
 default_assignee: jane@org.com # fallback when git blame can't resolve a Jira user
 local_max_attempts: 3

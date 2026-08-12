@@ -1,5 +1,5 @@
 import { NotImplementedError } from "../../errors.js";
-import type { AppConfig, DraftResult, ErrorReport } from "../../types.js";
+import type { AppConfig, DraftResult, ErrorReport, PriorAttempt } from "../../types.js";
 import type { ExistingPullRequest } from "../repo/types.js";
 import type { LLMProvider } from "./types.js";
 
@@ -14,6 +14,7 @@ async function draftFix(
   config: AppConfig,
   worktreePath: string,
   existingPR: ExistingPullRequest | undefined,
+  priorAttempt: PriorAttempt | undefined,
 ): Promise<DraftResult> {
   throw new NotImplementedError(
     "draftFix",

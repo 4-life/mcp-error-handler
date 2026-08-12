@@ -17,6 +17,7 @@ interface RawAppConfig {
   slack_channel: string;
   confluence_space?: string;
   ai_provider?: string;
+  install_cmd?: string;
   test_cmd?: string;
   default_assignee?: string;
   local_max_attempts?: number;
@@ -36,6 +37,7 @@ function toAppConfig(raw: RawAppConfig): AppConfig {
     slackChannel: raw.slack_channel,
     confluenceSpace: raw.confluence_space,
     aiProvider: (raw.ai_provider as AppConfig["aiProvider"]) ?? "claude",
+    installCmd: raw.install_cmd,
     testCmd: raw.test_cmd,
     defaultAssignee: raw.default_assignee,
     localMaxAttempts: raw.local_max_attempts ?? 3,
