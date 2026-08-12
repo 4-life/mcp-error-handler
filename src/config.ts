@@ -1,9 +1,9 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { load as parseYaml } from "js-yaml";
 import type { AppConfig } from "./types.js";
 
-const CONFIG_DIR = process.env.APP_CONFIG_DIR ?? join(process.cwd(), "config", "apps");
+const CONFIG_DIR = resolve(process.env.APP_CONFIG_DIR ?? join(process.cwd(), "config", "apps"));
 
 interface RawAppConfig {
   app_id: string;

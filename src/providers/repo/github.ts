@@ -1,13 +1,19 @@
 import { readFile } from "node:fs/promises";
 import { createSign } from "node:crypto";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { NotImplementedError } from "../../errors.js";
 import type { AppConfig, PullRequest } from "../../types.js";
 import * as git from "./git.js";
 import type { ExistingPullRequest, RepoProvider } from "./types.js";
 
-const REPO_CACHE_DIR = process.env.REPO_CACHE_DIR ?? join(process.cwd(), "data", "repos");
-const WORKTREE_DIR = process.env.WORKTREE_DIR ?? join(process.cwd(), "data", "worktrees");
+// resolve() normalizes a relative REPO_CACHE_DIR/WORKTREE_DIR (e.g. from .env, meant for local
+// dev where "./data/..." is natural) to absolute. Without this, a relative worktreePath means
+// different things to different callers: git.createWorktree's `git worktree add` runs with
+// cwd: repoDir, so a relative path argument resolves against repoDir, not this process's own
+// cwd — while everything else (existsSync checks, the SDK's spawn cwd) resolves it against
+// process.cwd(). Same string, two different real locations. Absolute paths have only one meaning.
+const REPO_CACHE_DIR = resolve(process.env.REPO_CACHE_DIR ?? join(process.cwd(), "data", "repos"));
+const WORKTREE_DIR = resolve(process.env.WORKTREE_DIR ?? join(process.cwd(), "data", "worktrees"));
 
 function base64url(input: string): string {
   return Buffer.from(input).toString("base64url");
