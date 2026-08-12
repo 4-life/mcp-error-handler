@@ -161,6 +161,7 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
     }
 
     if (skipReason) {
+      console.log(`reportError: skipped app "${config.appId}" (fingerprint ${fingerprint}) — ${skipReason}`);
       await repo.removeWorktree(repoDir, worktreePath);
       return { jobId, appId: config.appId, status: "skipped", reason: skipReason };
     }
