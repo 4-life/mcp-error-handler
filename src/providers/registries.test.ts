@@ -7,7 +7,7 @@ import { getMessengerProvider } from "./messenger/index.js";
 import { getLLMProvider } from "./llm/index.js";
 
 test("each registry resolves its default provider with the right shape", () => {
-  assert.equal(typeof getRepoProvider("github").findExistingPullRequest, "function");
+  assert.equal(typeof getRepoProvider("github").findExistingPullRequestByFingerprint, "function");
   assert.equal(typeof getTrackerProvider("jira").createTicket, "function");
   assert.equal(typeof getDocsProvider("confluence").fetchDocs, "function");
   assert.equal(typeof getMessengerProvider("slack").notify, "function");

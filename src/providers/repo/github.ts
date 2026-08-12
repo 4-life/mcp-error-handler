@@ -97,40 +97,51 @@ async function ensureCloned(config: AppConfig): Promise<string> {
   return repoDir;
 }
 
-async function createWorktree(config: AppConfig, repoDir: string, branchName: string): Promise<string> {
-  const worktreePath = join(WORKTREE_DIR, config.appId, branchName);
-  await git.createWorktree(repoDir, branchName, worktreePath, config.defaultBranch);
+async function createWorktree(config: AppConfig, repoDir: string, localBranchName: string): Promise<string> {
+  const worktreePath = join(WORKTREE_DIR, config.appId, localBranchName);
+  await git.createWorktree(repoDir, localBranchName, worktreePath, config.defaultBranch);
   return worktreePath;
 }
 
+const fingerprintMarker = (fingerprint: string) => `<!-- mcp-error-handler-fingerprint: ${fingerprint} -->`;
+
 /**
- * Looks up whether branchName already has a PR in this repo — open or closed. Branch names are
- * derived deterministically from the error's fingerprint (see orchestrator.ts), so this doubles
- * as the dedup check: no separate database of "have we seen this error before" needed, GitHub's
- * PR list already is one.
+ * Searches PR bodies for the fingerprint marker openPullRequest embeds — not a branch-name
+ * lookup, since the public branch name is the Jira ticket key, which doesn't exist yet at the
+ * point this check runs (it's fetched before the ticket does). Doubles as the dedup check: no
+ * separate database of "have we seen this error before" needed, GitHub's own search already is
+ * one. Note: GitHub's search API has a much lower rate limit than the regular REST API.
  */
-async function findExistingPullRequest(repoUrl: string, branchName: string): Promise<ExistingPullRequest | undefined> {
+async function findExistingPullRequestByFingerprint(repoUrl: string, fingerprint: string): Promise<ExistingPullRequest | undefined> {
   const { owner, repo } = parseGitHubRepo(repoUrl);
-  const res = await githubApi(`/repos/${owner}/${repo}/pulls?head=${owner}:${branchName}&state=all`);
+  const query = encodeURIComponent(`repo:${owner}/${repo} is:pr "${fingerprint}" in:body`);
+  const res = await githubApi(`/search/issues?q=${query}`);
   if (!res.ok) {
-    throw new Error(`GitHub PR lookup failed: ${res.status} ${await res.text()}`);
+    throw new Error(`GitHub PR search failed: ${res.status} ${await res.text()}`);
   }
-  const prs = (await res.json()) as Array<{ number: number; html_url: string; state: string }>;
-  const pr = prs[0];
+  const data = (await res.json()) as { items: Array<{ number: number; html_url: string; state: string }> };
+  const pr = data.items[0];
   return pr ? { number: pr.number, url: pr.html_url, state: pr.state } : undefined;
 }
 
-async function pushBranch(config: AppConfig, worktreePath: string, branchName: string): Promise<void> {
+async function pushBranch(config: AppConfig, worktreePath: string, localBranchName: string, remoteBranchName: string): Promise<void> {
   const authedUrl = await authenticatedCloneUrl(config.repoUrl);
   await git.run("git", ["remote", "set-url", "origin", authedUrl], worktreePath);
-  await git.run("git", ["push", "-u", "origin", branchName], worktreePath);
+  await git.run("git", ["push", "-u", "origin", `${localBranchName}:${remoteBranchName}`], worktreePath);
 }
 
-/** TODO: implement — POST /repos/{owner}/{repo}/pulls once there's a real fix to open a PR for. */
-async function openPullRequest(config: AppConfig, branchName: string, title: string, body: string): Promise<PullRequest> {
+/** TODO: implement — POST /repos/{owner}/{repo}/pulls once there's a real fix to open a PR for. Must include fingerprintMarker(fingerprint) in the body so findExistingPullRequestByFingerprint can find this PR later. */
+async function openPullRequest(
+  config: AppConfig,
+  remoteBranchName: string,
+  title: string,
+  body: string,
+  fingerprint: string,
+): Promise<PullRequest> {
   throw new NotImplementedError(
     "openPullRequest",
-    `branch ${branchName} is pushed — needs the PR-creation call against ${config.repoUrl} ("${title}")`,
+    `branch ${remoteBranchName} is pushed — needs the PR-creation call against ${config.repoUrl} ("${title}"), ` +
+      `body must include ${fingerprintMarker(fingerprint)}`,
   );
 }
 
@@ -139,7 +150,7 @@ export const githubRepoProvider: RepoProvider = {
   createWorktree,
   removeWorktree: git.removeWorktree,
   blameAuthors: git.blameAuthors,
-  findExistingPullRequest,
+  findExistingPullRequestByFingerprint,
   pushBranch,
   openPullRequest,
 };

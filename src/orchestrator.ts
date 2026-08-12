@@ -14,21 +14,24 @@ interface Job {
   jobId: string;
   appId: string;
   worktreePath: string;
-  branchName: string;
+  /** The scratch branch inside the worktree — never pushed under this name. */
+  localBranchName: string;
+  /** The public GitHub branch name (`fix/<jira-key>`) — only known once the ticket exists. */
+  remoteBranchName?: string;
   ciAttempts: number;
   ticket?: Ticket;
 }
 const jobs = new Map<string, Job>();
 
 /**
- * Branch names currently being worked on. Guards the window the PR-based dedup check can't see:
+ * Fingerprints currently being worked on. Guards the window the PR-based dedup check can't see:
  * a second identical error arriving while the first is still mid-pipeline (before anything's been
  * pushed) would otherwise race to create the same git worktree. In-memory only — see the Job map
  * comment above for the same caveat.
  */
-const inFlightBranches = new Set<string>();
+const inFlightFingerprints = new Set<string>();
 
-/** Caps how many draftFix calls (the slow, costly, rate-limited part) run at once, queuing the rest — unrelated to inFlightBranches, which caps duplicates of the *same* error rather than total load. */
+/** Caps how many draftFix calls (the slow, costly, rate-limited part) run at once, queuing the rest — unrelated to inFlightFingerprints, which caps duplicates of the *same* error rather than total load. */
 class Semaphore {
   private available: number;
   private readonly queue: Array<() => void> = [];
@@ -57,12 +60,11 @@ class Semaphore {
 const draftSemaphore = new Semaphore(Number(process.env.MAX_CONCURRENT_DRAFTS ?? 3));
 
 /**
- * A stable id for "this error" — used as the branch name, which is what makes the repo host's
- * own PR list double as the dedup store (see RepoProvider.findExistingPullRequest). Prefers a
- * source-provided stable id (e.g. Sentry's grouped issue id) so repeated firings of the same
- * issue map to the same branch; falls back to hashing the whole payload for sources with no
- * recognizable id, which won't dedupe as well but is at least deterministic for identical
- * payloads.
+ * A stable id for "this error" — the dedup key (see RepoProvider.findExistingPullRequestByFingerprint)
+ * and the in-flight lock key. Prefers a source-provided stable id (e.g. Sentry's grouped issue id)
+ * so repeated firings of the same issue map to the same fingerprint; falls back to hashing the
+ * whole payload for sources with no recognizable id, which won't dedupe as well but is at least
+ * deterministic for identical payloads.
  */
 function fingerprintReport(report: ErrorReport): string {
   const data = report.data as Record<string, unknown> | undefined;
@@ -90,13 +92,16 @@ async function runLocalTests(config: AppConfig, worktreePath: string): Promise<T
 
 /**
  * Load config, resolve this app's providers, update the repo, then hand everything to the AI in
- * one call: the raw report, whether a PR already exists for this error's branch, and full repo
- * access. The AI is the single decision point — production vs. not, already handled vs. not, and
- * (if it decides to proceed) the fix itself. Nothing is created — no ticket, no branch pushed —
- * until it says so. If the AI isn't configured at all, this fails outright (NotImplementedError
- * propagates) rather than falling back to a ticket — a ticket without the AI's judgment isn't the
- * intended behavior. The GitHub Actions CI follow-up loop lives in handleCIResult below, since CI
- * completion arrives later as its own webhook event, not inline in this call.
+ * one call: the raw report, whether a PR already exists for this error, and full repo access. The
+ * AI is the single decision point — production vs. not, already handled vs. not, and (if it
+ * decides to proceed) the fix itself. Nothing is created — no ticket, no branch pushed — until it
+ * says so. If the AI isn't configured at all, this fails outright (NotImplementedError propagates)
+ * rather than falling back to a ticket — a ticket without the AI's judgment isn't the intended
+ * behavior. The public branch name is the Jira ticket key (`fix/<jira-key>`), so it can't be
+ * chosen until the ticket exists — the worktree uses a throwaway local name (`wip/<fingerprint>`)
+ * until then, pushed under the real name at the very end. The GitHub Actions CI follow-up loop
+ * lives in handleCIResult below, since CI completion arrives later as its own webhook event, not
+ * inline in this call.
  */
 export async function reportError(report: ErrorReport): Promise<ReportErrorResult> {
   const config = getAppConfig(report.appId);
@@ -106,21 +111,22 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
   const llm = getLLMProvider(config.aiProvider);
 
   const jobId = randomUUID();
-  const branchName = `fix/${fingerprintReport(report)}`;
+  const fingerprint = fingerprintReport(report);
+  const localBranchName = `wip/${fingerprint}`;
 
-  if (inFlightBranches.has(branchName)) {
+  if (inFlightFingerprints.has(fingerprint)) {
     return { jobId, appId: config.appId, status: "skipped", reason: "an identical error is already being processed" };
   }
-  inFlightBranches.add(branchName);
+  inFlightFingerprints.add(fingerprint);
 
   try {
     // Fetched deterministically (it's just a repo-host API call) — but what to do with it is the
     // AI's call, made together with the production/non-production judgment inside draftFix.
-    const existingPR = await repo.findExistingPullRequest(config.repoUrl, branchName);
+    const existingPR = await repo.findExistingPullRequestByFingerprint(config.repoUrl, fingerprint);
 
     const repoDir = await repo.ensureCloned(config);
-    const worktreePath = await repo.createWorktree(config, repoDir, branchName);
-    const job: Job = { jobId, appId: config.appId, worktreePath, branchName, ciAttempts: 0 };
+    const worktreePath = await repo.createWorktree(config, repoDir, localBranchName);
+    const job: Job = { jobId, appId: config.appId, worktreePath, localBranchName, ciAttempts: 0 };
     jobs.set(jobId, job);
 
     let draft: FixDraft | undefined;
@@ -165,12 +171,14 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
       return { jobId, appId: config.appId, ticket, status: "ticket_only" };
     }
 
-    await repo.pushBranch(config, worktreePath, branchName);
-    const pr = await repo.openPullRequest(config, branchName, draft.summary.slice(0, 72), ticket.url);
+    const remoteBranchName = `fix/${ticket.key}`;
+    job.remoteBranchName = remoteBranchName;
+    await repo.pushBranch(config, worktreePath, localBranchName, remoteBranchName);
+    const pr = await repo.openPullRequest(config, remoteBranchName, draft.summary.slice(0, 72), ticket.url, fingerprint);
     await messenger.notify(config, ticket, pr);
     return { jobId, appId: config.appId, ticket, pullRequest: pr, status: "pr_pending_ci" };
   } finally {
-    inFlightBranches.delete(branchName);
+    inFlightFingerprints.delete(fingerprint);
   }
 }
 
@@ -182,22 +190,22 @@ export async function reportError(report: ErrorReport): Promise<ReportErrorResul
  * itself is unchanged and still fully awaitable for callers that want the real result inline
  * (the MCP tool, manual testing).
  */
-export function reportErrorAsync(report: ErrorReport): { branchName: string; accepted: boolean } {
+export function reportErrorAsync(report: ErrorReport): { fingerprint: string; accepted: boolean } {
   const config = getAppConfig(report.appId); // throws synchronously on an unknown app_id, surfacing immediately
-  const branchName = `fix/${fingerprintReport(report)}`;
-  if (inFlightBranches.has(branchName)) {
-    return { branchName, accepted: false };
+  const fingerprint = fingerprintReport(report);
+  if (inFlightFingerprints.has(fingerprint)) {
+    return { fingerprint, accepted: false };
   }
   reportError(report).catch((err) => {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`reportError failed for app "${report.appId}" (branch ${branchName}):`, err);
+    console.error(`reportError failed for app "${report.appId}" (fingerprint ${fingerprint}):`, err);
     // Best-effort — if the failure is Slack itself (bad token, rate limit), this would just fail
     // again; log rather than let a second throw escape this .catch() as an unhandled rejection.
     getMessengerProvider(config.messengerProvider)
-      .alertError(config, `Branch \`${branchName}\`: ${message}`)
+      .alertError(config, `Fingerprint \`${fingerprint}\`: ${message}`)
       .catch((alertErr) => console.error("Also failed to send the Slack alert for that failure:", alertErr));
   });
-  return { branchName, accepted: true };
+  return { fingerprint, accepted: true };
 }
 
 /**
